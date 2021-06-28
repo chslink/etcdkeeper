@@ -12,17 +12,17 @@ import (
 )
 
 type Session interface {
-	Set(key, value interface{}) error //set session value
-	Get(key interface{}) interface{}  //get session value
-	Delete(key interface{}) error     //delete session value
-	SessionID() string                //back current sessionID
+	Set(key, value interface{}) error // set session value
+	Get(key interface{}) interface{}  // get session value
+	Delete(key interface{}) error     // delete session value
+	SessionID() string                // back current sessionID
 }
 
 type Provider interface {
 	SessionInit(sid string) (Session, error)
 	SessionRead(sid string) (Session, error)
 	SessionDestroy(sid string) error
-	SessionGC(maxlifetime int64)
+	SessionGC(maxLifetime int64)
 }
 
 var provides = make(map[string]Provider)
@@ -41,21 +41,21 @@ func Register(name string, provide Provider) {
 }
 
 type Manager struct {
-	cookieName  string     //private cookiename
+	cookieName  string     // private cookies name
 	lock        sync.Mutex // protects session
 	provider    Provider
-	maxlifetime int64
+	maxLifetime int64
 }
 
-func NewManager(provideName, cookieName string, maxlifetime int64) (*Manager, error) {
-	provider, ok := provides[provideName]
+func NewManager(provideName, cookieName string, maxLifetime int64) (*Manager, error) {
+	p, ok := provides[provideName]
 	if !ok {
 		return nil, fmt.Errorf("session: unknown provide %q (forgotten import?)", provideName)
 	}
-	return &Manager{provider: provider, cookieName: cookieName, maxlifetime: maxlifetime}, nil
+	return &Manager{provider: p, cookieName: cookieName, maxLifetime: maxLifetime}, nil
 }
 
-//get Session
+// SessionStart get Session
 func (manager *Manager) SessionStart(w http.ResponseWriter, r *http.Request) (session Session) {
 	manager.lock.Lock()
 	defer manager.lock.Unlock()
@@ -63,7 +63,7 @@ func (manager *Manager) SessionStart(w http.ResponseWriter, r *http.Request) (se
 	if err != nil || cookie.Value == "" {
 		sid := manager.sessionId()
 		session, _ = manager.provider.SessionInit(sid)
-		cookie := http.Cookie{Name: manager.cookieName, Value: url.QueryEscape(sid), Path: "/", HttpOnly: true, MaxAge: int(manager.maxlifetime)}
+		cookie := http.Cookie{Name: manager.cookieName, Value: url.QueryEscape(sid), Path: "/", HttpOnly: true, MaxAge: int(manager.maxLifetime)}
 		http.SetCookie(w, &cookie)
 	} else {
 		sid, _ := url.QueryUnescape(cookie.Value)
@@ -72,7 +72,7 @@ func (manager *Manager) SessionStart(w http.ResponseWriter, r *http.Request) (se
 	return
 }
 
-//Destroy sessionid
+// SessionDestroy Destroy SessionId
 func (manager *Manager) SessionDestroy(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie(manager.cookieName)
 	if err != nil || cookie.Value == "" {
@@ -90,8 +90,8 @@ func (manager *Manager) SessionDestroy(w http.ResponseWriter, r *http.Request) {
 func (manager *Manager) GC() {
 	manager.lock.Lock()
 	defer manager.lock.Unlock()
-	manager.provider.SessionGC(manager.maxlifetime)
-	time.AfterFunc(time.Duration(manager.maxlifetime)*time.Second, func() { manager.GC() })
+	manager.provider.SessionGC(manager.maxLifetime)
+	time.AfterFunc(time.Duration(manager.maxLifetime)*time.Second, func() { manager.GC() })
 }
 
 func (manager *Manager) sessionId() string {

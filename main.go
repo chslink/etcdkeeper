@@ -3,24 +3,25 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"embed"
 	"encoding/json"
-	"etcdkeeper/session"
-	_ "etcdkeeper/session/providers/memory"
 	"flag"
 	"fmt"
-	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/pkg/transport"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"etcdkeeper/session"
+
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/client/v2"
+	"go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 )
 
@@ -31,12 +32,12 @@ var (
 	cacert         = flag.String("cacert", "", "verify certificates of TLS-enabled secure servers using this CA bundle (v3)")
 	cert           = flag.String("cert", "", "identify secure client using this TLS certificate file (v3)")
 	keyfile        = flag.String("key", "", "identify secure client using this TLS key file (v3)")
-	useAuth        = flag.Bool("auth", false, "use auth")
+	useAuth        = flag.Bool("auth", true, "use auth")
 	connectTimeout = flag.Int("timeout", 5, "ETCD client connect timeout")
 	rootUsers      = make(map[string]*userInfo) // host:rootUser
-	rootUesrsV2    = make(map[string]*userInfo) // host:rootUser
+	rootUsersV2    = make(map[string]*userInfo) // host:rootUser
 
-	sessmgr *session.Manager
+	manager *session.Manager
 	mu      sync.Mutex
 )
 
@@ -46,11 +47,14 @@ type userInfo struct {
 	passwd string
 }
 
+//go:embed assets
+var assets embed.FS
+
 func main() {
-	host := flag.String("h","0.0.0.0","host name or ip address")
+	host := flag.String("h", "0.0.0.0", "host name or ip address")
 	port := flag.Int("p", 8080, "port")
 
-	flag.CommandLine.Parse(os.Args[1:])
+	flag.Parse()
 	separator = *sep
 
 	middleware := func(fns ...func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
@@ -62,86 +66,58 @@ func main() {
 	}
 
 	// v2
-	//http.HandleFunc(*name, v2request)
-	http.HandleFunc("/v2/separator", middleware(nothing, getSeparator))
-	http.HandleFunc("/v2/connect", middleware(nothing, connectV2))
-	http.HandleFunc("/v2/put", middleware(nothing, putV2))
-	http.HandleFunc("/v2/get", middleware(nothing, getV2))
-	http.HandleFunc("/v2/delete", middleware(nothing, delV2))
-	// dirctory mode
-	http.HandleFunc("/v2/getpath", middleware(nothing, getPathV2))
+	// http.HandleFunc(*name, v2request)
+	http.HandleFunc("/v2/separator", middleware(logging, getSeparator))
+	http.HandleFunc("/v2/connect", middleware(logging, connectV2))
+	http.HandleFunc("/v2/put", middleware(logging, putV2))
+	http.HandleFunc("/v2/get", middleware(logging, getV2))
+	http.HandleFunc("/v2/delete", middleware(logging, delV2))
+	// directory mode
+	http.HandleFunc("/v2/getpath", middleware(logging, getPathV2))
 
 	// v3
-	http.HandleFunc("/v3/separator", middleware(nothing, getSeparator))
-	http.HandleFunc("/v3/connect", middleware(nothing, connect))
-	http.HandleFunc("/v3/put", middleware(nothing, put))
-	http.HandleFunc("/v3/get", middleware(nothing, get))
-	http.HandleFunc("/v3/delete", middleware(nothing, del))
-	// dirctory mode
-	http.HandleFunc("/v3/getpath", middleware(nothing, getPath))
+	http.HandleFunc("/v3/separator", middleware(logging, getSeparator))
+	http.HandleFunc("/v3/connect", middleware(logging, connect))
+	http.HandleFunc("/v3/put", middleware(logging, put))
+	http.HandleFunc("/v3/get", middleware(logging, get))
+	http.HandleFunc("/v3/delete", middleware(logging, del))
+	// directory mode
+	http.HandleFunc("/v3/getpath", middleware(logging, getPath))
 
-	wd, err := os.Executable()
-	if err != nil {
-		log.Fatal(err)
-	}
-	rootPath := filepath.Dir(wd)
-
+	var err error
 	// Session management
-	sessmgr, err = session.NewManager("memory", "_etcdkeeper_session", 86400)
+	manager, err = session.NewManager("memory", "_etcdkeeper_session", 86400)
 	if err != nil {
 		log.Fatal(err)
 	}
 	time.AfterFunc(86400*time.Second, func() {
-		sessmgr.GC()
+		manager.GC()
 	})
-	//log.Println(http.Dir(rootPath + "/assets"))
+	// log.Println(http.Dir(rootPath + "/assets"))
+	assetsDir, err := fs.Sub(assets,"assets")
+	if err!=nil{
+		log.Fatal(err)
+	}
 
-	http.Handle("/", http.FileServer(http.Dir(rootPath + "/assets"))) // view static directory
+	http.Handle("/", http.FileServer(http.FS(assetsDir))) // view static directory
 
 	log.Printf("listening on %s:%d\n", *host, *port)
-	err = http.ListenAndServe(*host + ":" + strconv.Itoa(*port), nil)
+	err = http.ListenAndServe(*host+":"+strconv.Itoa(*port), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func nothing(_ http.ResponseWriter, _ *http.Request) {
+func logging(_ http.ResponseWriter, r *http.Request) {
+	log.Println(r.RequestURI)
 	// Nothing
 }
-
-
-//func v2request(w http.ResponseWriter, r *http.Request){
-//	if err := r.ParseForm(); err != nil {
-//		log.Println(err.Error())
-//	}
-//	log.Println(r.Method, "v2", r.FormValue("url"), r.PostForm.Encode())
-//
-//	body := strings.NewReader(r.PostForm.Encode())
-//	req, err := http.NewRequest(r.Method, r.Form.Get("url"), body)
-//	if err != nil {
-//		io.WriteString(w, err.Error())
-//		return
-//	}
-//	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-//	client := &http.Client{Timeout: 10*time.Second} // important!!!
-//	resp, err := client.Do(req)
-//	if err != nil {
-//		io.WriteString(w, err.Error())
-//	}else {
-//		result, err := ioutil.ReadAll(resp.Body)
-//		if err != nil {
-//			io.WriteString(w, "Get data failed: " + err.Error())
-//		} else {
-//			io.WriteString(w, string(result))
-//		}
-//	}
-//}
 
 // v2 api
 func connectV2(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	host := strings.TrimSpace(r.FormValue("host"))
 	uname := r.FormValue("uname")
 	passwd := r.FormValue("passwd")
@@ -150,14 +126,14 @@ func connectV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if *useAuth {
-		_, ok := rootUesrsV2[host]
+		_, ok := rootUsersV2[host]
 		if !ok && uname != "root" {
-			b, _ := json.Marshal(map[string]interface{}{"status":"root"})
+			b, _ := json.Marshal(map[string]interface{}{"status": "root"})
 			io.WriteString(w, string(b))
 			return
 		}
 		if uname == "" || passwd == "" {
-			b, _ := json.Marshal(map[string]interface{}{"status":"login"})
+			b, _ := json.Marshal(map[string]interface{}{"status": "login"})
 			io.WriteString(w, string(b))
 			return
 		}
@@ -166,17 +142,17 @@ func connectV2(w http.ResponseWriter, r *http.Request) {
 	if uinfo, ok := sess.Get("uinfov2").(*userInfo); ok {
 		if host == uinfo.host && uname == uinfo.uname && passwd == uinfo.passwd {
 			info := getInfoV2(host)
-			b, _ := json.Marshal(map[string]interface{}{"status":"running", "info":info})
+			b, _ := json.Marshal(map[string]interface{}{"status": "running", "info": info})
 			io.WriteString(w, string(b))
 			return
 		}
 	}
 
-	uinfo := &userInfo{host:host, uname:uname, passwd:passwd}
+	uinfo := &userInfo{host: host, uname: uname, passwd: passwd}
 	_, err := newClientV2(uinfo)
 	if err != nil {
 		log.Println(r.Method, "v2", "connect fail.")
-		b, _ := json.Marshal(map[string]interface{}{"status":"error", "message":err.Error()})
+		b, _ := json.Marshal(map[string]interface{}{"status": "error", "message": err.Error()})
 		io.WriteString(w, string(b))
 		return
 	}
@@ -184,14 +160,14 @@ func connectV2(w http.ResponseWriter, r *http.Request) {
 
 	if *useAuth {
 		if uname == "root" {
-			rootUesrsV2[host] = uinfo
+			rootUsersV2[host] = uinfo
 		}
 	} else {
-		rootUesrsV2[host] = uinfo
+		rootUsersV2[host] = uinfo
 	}
 	log.Println(r.Method, "v2", "connect success.")
 	info := getInfoV2(host)
-	b, _ := json.Marshal(map[string]interface{}{"status":"running", "info":info})
+	b, _ := json.Marshal(map[string]interface{}{"status": "running", "info": info})
 	io.WriteString(w, string(b))
 }
 
@@ -216,15 +192,15 @@ func putV2(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Println(err.Error())
 		}
-		_, err = kapi.Set(context.Background(), key, value, &client.SetOptions{TTL:time.Duration(sec)*time.Second, Dir:isDir})
+		_, err = kapi.Set(context.Background(), key, value, &client.SetOptions{TTL: time.Duration(sec) * time.Second, Dir: isDir})
 	} else {
-		_, err = kapi.Set(context.Background(), key, value, &client.SetOptions{Dir:isDir})
+		_, err = kapi.Set(context.Background(), key, value, &client.SetOptions{Dir: isDir})
 	}
 	if err != nil {
 		data["errorCode"] = 500
 		data["message"] = err.Error()
 	} else {
-		if resp, err := kapi.Get(context.Background(), key, &client.GetOptions{Recursive:true, Sort:true}); err != nil {
+		if resp, err := kapi.Get(context.Background(), key, &client.GetOptions{Recursive: true, Sort: true}); err != nil {
 			data["errorCode"] = err.Error()
 		} else {
 			if resp.Node != nil {
@@ -241,7 +217,7 @@ func putV2(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var dataByte []byte
-	if dataByte, err = json.Marshal(data);err != nil {
+	if dataByte, err = json.Marshal(data); err != nil {
 		io.WriteString(w, err.Error())
 	} else {
 		io.WriteString(w, string(dataByte))
@@ -254,7 +230,7 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 	log.Println("GET", "v2", key)
 
 	var cli client.Client
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	v := sess.Get("uinfov2")
 	var uinfo *userInfo
 	if v != nil {
@@ -285,7 +261,7 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 		max = min
 		all := make(map[int][]map[string]interface{})
 		if key == separator {
-			all[min] = []map[string]interface{}{{"key":key, "value":"", "dir":true, "nodes":make([]map[string]interface{}, 0)}}
+			all[min] = []map[string]interface{}{{"key": key, "value": "", "dir": true, "nodes": make([]map[string]interface{}, 0)}}
 		}
 		for _, p := range permissions {
 			pKey, pRange := p[0], p[1]
@@ -294,7 +270,7 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 				if pRange == "c" {
 					pKey += separator
 				}
-				opt = &client.GetOptions{Recursive:true, Sort:true}
+				opt = &client.GetOptions{Recursive: true, Sort: true}
 			}
 			if resp, err := kapi.Get(context.Background(), pKey, opt); err != nil {
 				data["errorCode"] = 500
@@ -304,13 +280,13 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 					data["errorCode"] = 500
 					data["message"] = "The node does not exist."
 				} else {
-					max = getNode(resp.Node , key, all, min, max)
+					max = getNode(resp.Node, key, all, min, max)
 				}
 			}
 		}
 
-		//b, _ := json.MarshalIndent(all, "", "  ")
-		//fmt.Println(string(b))
+		// b, _ := json.MarshalIndent(all, "", "  ")
+		// fmt.Println(string(b))
 
 		// parent-child mapping
 		for i := max; i > min; i-- {
@@ -320,7 +296,7 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 						pa["nodes"] = append(pa["nodes"].([]map[string]interface{}), a)
 						pa["dir"] = true
 					} else {
-						if strings.HasPrefix(a["key"].(string), pa["key"].(string) + separator) {
+						if strings.HasPrefix(a["key"].(string), pa["key"].(string)+separator) {
 							pa["nodes"] = append(pa["nodes"].([]map[string]interface{}), a)
 							pa["dir"] = true
 						}
@@ -340,7 +316,7 @@ func getV2(w http.ResponseWriter, r *http.Request) {
 
 	var dataByte []byte
 	var err error
-	if dataByte, err = json.Marshal(data);err != nil {
+	if dataByte, err = json.Marshal(data); err != nil {
 		io.WriteString(w, err.Error())
 	} else {
 		io.WriteString(w, string(dataByte))
@@ -351,7 +327,7 @@ func nodesSort(node map[string]interface{}) {
 	if v, ok := node["nodes"]; ok && v != nil {
 		a := v.([]map[string]interface{})
 		if len(a) != 0 {
-			for i := 0; i < len(a) - 1; i++ {
+			for i := 0; i < len(a)-1; i++ {
 				nodesSort(a[i])
 				for j := i + 1; j < len(a); j++ {
 					if a[j]["key"].(string) < a[i]["key"].(string) {
@@ -359,7 +335,7 @@ func nodesSort(node map[string]interface{}) {
 					}
 				}
 			}
-			nodesSort(a[len(a) - 1])
+			nodesSort(a[len(a)-1])
 		}
 	}
 }
@@ -374,7 +350,7 @@ func getNode(node *client.Node, selKey string, all map[int][]map[string]interfac
 		if k == "" {
 			continue
 		}
-		nodeMap := map[string]interface{}{"key": k, "dir":true, "nodes":make([]map[string]interface{}, 0)}
+		nodeMap := map[string]interface{}{"key": k, "dir": true, "nodes": make([]map[string]interface{}, 0)}
 		if k == node.Key {
 			nodeMap["value"] = node.Value
 			nodeMap["dir"] = node.Dir
@@ -387,7 +363,7 @@ func getNode(node *client.Node, selKey string, all map[int][]map[string]interfac
 			max = keylevel
 		}
 
-		if _, ok := all[keylevel];!ok {
+		if _, ok := all[keylevel]; !ok {
 			all[keylevel] = make([]map[string]interface{}, 0)
 		}
 		var isExist bool
@@ -418,7 +394,7 @@ func delV2(w http.ResponseWriter, r *http.Request) {
 
 	isDir, _ := strconv.ParseBool(dir)
 	if isDir {
-		if _, err := kapi.Delete(context.Background(), key, &client.DeleteOptions{Recursive:true, Dir:true}); err != nil {
+		if _, err := kapi.Delete(context.Background(), key, &client.DeleteOptions{Recursive: true, Dir: true}); err != nil {
 			io.WriteString(w, err.Error())
 			return
 		}
@@ -437,7 +413,7 @@ func getPathV2(w http.ResponseWriter, r *http.Request) {
 }
 
 func getClientV2(w http.ResponseWriter, r *http.Request) client.Client {
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	v := sess.Get("uinfov2")
 	if v != nil {
 		uinfo := v.(*userInfo)
@@ -475,7 +451,7 @@ func getPermissionPrefixV2(host, uname, key string) ([][]string, error) {
 		if !strings.HasPrefix(host, "http://") {
 			host = "http://" + host
 		}
-		rootUser := rootUesrsV2[host]
+		rootUser := rootUsersV2[host]
 		rootCli, err := newClientV2(rootUser)
 		if err != nil {
 			return nil, err
@@ -502,10 +478,10 @@ func getPermissionPrefixV2(host, uname, key string) ([][]string, error) {
 						for _, ks := range role.Permissions.KV.Read {
 							var k string
 							if strings.HasSuffix(ks, "*") {
-								k = ks[:len(ks) - 1]
+								k = ks[:len(ks)-1]
 								set[k] = "p"
 							} else if strings.HasSuffix(ks, "/*") {
-								k = ks[:len(ks) - 2]
+								k = ks[:len(ks)-2]
 								set[k] = "c"
 							} else {
 								if _, ok := set[ks]; !ok {
@@ -536,7 +512,7 @@ func getInfoV2(host string) map[string]string {
 		host = "http://" + host
 	}
 	info := make(map[string]string)
-	uinfo, ok := rootUesrsV2[host]
+	uinfo, ok := rootUsersV2[host]
 	if ok {
 		rootClient, err := newClientV2(uinfo)
 		if err != nil {
@@ -563,19 +539,19 @@ func getInfoV2(host string) map[string]string {
 func connect(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	host := r.FormValue("host")
 	uname := r.FormValue("uname")
 	passwd := r.FormValue("passwd")
 
 	if *useAuth {
 		if _, ok := rootUsers[host]; !ok && uname != "root" { // no root user
-			b, _ := json.Marshal(map[string]interface{}{"status":"root"})
+			b, _ := json.Marshal(map[string]interface{}{"status": "root"})
 			io.WriteString(w, string(b))
 			return
 		}
 		if uname == "" || passwd == "" {
-			b, _ := json.Marshal(map[string]interface{}{"status":"login"})
+			b, _ := json.Marshal(map[string]interface{}{"status": "login"})
 			io.WriteString(w, string(b))
 			return
 		}
@@ -584,17 +560,17 @@ func connect(w http.ResponseWriter, r *http.Request) {
 	if uinfo, ok := sess.Get("uinfo").(*userInfo); ok {
 		if host == uinfo.host && uname == uinfo.uname && passwd == uinfo.passwd {
 			info := getInfo(host)
-			b, _ := json.Marshal(map[string]interface{}{"status":"running", "info":info})
+			b, _ := json.Marshal(map[string]interface{}{"status": "running", "info": info})
 			io.WriteString(w, string(b))
 			return
 		}
 	}
 
-	uinfo := &userInfo{host:host, uname:uname, passwd:passwd}
+	uinfo := &userInfo{host: host, uname: uname, passwd: passwd}
 	c, err := newClient(uinfo)
 	if err != nil {
 		log.Println(r.Method, "v3", "connect fail.")
-		b, _ := json.Marshal(map[string]interface{}{"status":"error", "message":err.Error()})
+		b, _ := json.Marshal(map[string]interface{}{"status": "error", "message": err.Error()})
 		io.WriteString(w, string(b))
 		return
 	}
@@ -610,7 +586,7 @@ func connect(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Println(r.Method, "v3", "connect success.")
 	info := getInfo(host)
-	b, _ := json.Marshal(map[string]interface{}{"status":"running", "info":info})
+	b, _ := json.Marshal(map[string]interface{}{"status": "running", "info": info})
 	io.WriteString(w, string(b))
 }
 
@@ -642,7 +618,7 @@ func put(w http.ResponseWriter, r *http.Request) {
 		data["errorCode"] = 500
 		data["message"] = err.Error()
 	} else {
-		if resp, err := cli.Get(context.Background(), key);err != nil {
+		if resp, err := cli.Get(context.Background(), key); err != nil {
 			data["errorCode"] = 500
 			data["errorCode"] = err.Error()
 		} else {
@@ -661,7 +637,7 @@ func put(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var dataByte []byte
-	if dataByte, err = json.Marshal(data);err != nil {
+	if dataByte, err = json.Marshal(data); err != nil {
 		io.WriteString(w, err.Error())
 	} else {
 		io.WriteString(w, string(dataByte))
@@ -674,7 +650,7 @@ func get(w http.ResponseWriter, r *http.Request) {
 	log.Println("GET", "v3", key)
 
 	var cli *clientv3.Client
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	v := sess.Get("uinfo")
 	var uinfo *userInfo
 	if v != nil {
@@ -728,7 +704,7 @@ func get(w http.ResponseWriter, r *http.Request) {
 			}
 			data["node"] = pnode
 		} else {
-			if resp, err := cli.Get(context.Background(), key);err != nil {
+			if resp, err := cli.Get(context.Background(), key); err != nil {
 				data["errorCode"] = 500
 				data["message"] = err.Error()
 			} else {
@@ -752,7 +728,7 @@ func get(w http.ResponseWriter, r *http.Request) {
 
 	var dataByte []byte
 	var err error
-	if dataByte, err = json.Marshal(data);err != nil {
+	if dataByte, err = json.Marshal(data); err != nil {
 		io.WriteString(w, err.Error())
 	} else {
 		io.WriteString(w, string(dataByte))
@@ -766,15 +742,15 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 		data = make(map[string]interface{})
 		/*
 			{1:["/"], 2:["/foo", "/foo2"], 3:["/foo/bar", "/foo2/bar"], 4:["/foo/bar/test"]}
-		 */
+		*/
 		all = make(map[int][]map[string]interface{})
 		min int
 		max int
-		//prefixKey string
+		// prefixKey string
 	)
 
 	var cli *clientv3.Client
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	v := sess.Get("uinfo")
 	var uinfo *userInfo
 	if v != nil {
@@ -805,13 +781,13 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 		}
 		if originKey == separator {
 			min = 1
-			//prefixKey = separator
+			// prefixKey = separator
 		} else {
 			min = len(strings.Split(originKey, separator))
-			//prefixKey = originKey
+			// prefixKey = originKey
 		}
 		max = min
-		all[min] = []map[string]interface{}{{"key":originKey}}
+		all[min] = []map[string]interface{}{{"key": originKey}}
 		if presp != nil && presp.Count != 0 {
 			all[min][0]["value"] = string(presp.Kvs[0].Value)
 			all[min][0]["ttl"] = getTTL(cli, presp.Kvs[0].Lease)
@@ -822,7 +798,7 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 
 		for _, p := range permissions {
 			key, rangeEnd := p[0], p[1]
-			//child
+			// child
 			var resp *clientv3.GetResponse
 			if rangeEnd != "" {
 				resp, err = cli.Get(context.Background(), key, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
@@ -842,12 +818,12 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				keys := strings.Split(string(kv.Key), separator) // /foo/bar
-				for i := range keys { // ["", "foo", "bar"]
+				for i := range keys {                            // ["", "foo", "bar"]
 					k := strings.Join(keys[0:i+1], separator)
 					if k == "" {
 						continue
 					}
-					node := map[string]interface{}{"key":k}
+					node := map[string]interface{}{"key": k}
 					if node["key"].(string) == string(kv.Key) {
 						node["value"] = string(kv.Value)
 						if key == string(kv.Key) {
@@ -863,7 +839,7 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 						max = level
 					}
 
-					if _, ok := all[level];!ok {
+					if _, ok := all[level]; !ok {
 						all[level] = make([]map[string]interface{}, 0)
 					}
 					levelNodes := all[level]
@@ -889,7 +865,7 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 						pa["nodes"] = append(pa["nodes"].([]map[string]interface{}), a)
 						pa["dir"] = true
 					} else {
-						if strings.HasPrefix(a["key"].(string), pa["key"].(string) +separator) {
+						if strings.HasPrefix(a["key"].(string), pa["key"].(string)+separator) {
 							pa["nodes"] = append(pa["nodes"].([]map[string]interface{}), a)
 							pa["dir"] = true
 						}
@@ -899,7 +875,7 @@ func getPath(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	data = all[min][0]
-	if dataByte, err := json.Marshal(map[string]interface{}{"node":data});err != nil {
+	if dataByte, err := json.Marshal(map[string]interface{}{"node": data}); err != nil {
 		io.WriteString(w, err.Error())
 	} else {
 		io.WriteString(w, string(dataByte))
@@ -913,13 +889,13 @@ func del(w http.ResponseWriter, r *http.Request) {
 	dir := r.FormValue("dir")
 	log.Println("DELETE", "v3", key)
 
-	if _, err := cli.Delete(context.Background(), key);err != nil {
+	if _, err := cli.Delete(context.Background(), key); err != nil {
 		io.WriteString(w, err.Error())
 		return
 	}
 
 	if dir == "true" {
-		if _, err := cli.Delete(context.Background(), key +separator, clientv3.WithPrefix());err != nil {
+		if _, err := cli.Delete(context.Background(), key+separator, clientv3.WithPrefix()); err != nil {
 			io.WriteString(w, err.Error())
 			return
 		}
@@ -943,7 +919,7 @@ func getSeparator(w http.ResponseWriter, _ *http.Request) {
 }
 
 func getClient(w http.ResponseWriter, r *http.Request) *clientv3.Client {
-	sess := sessmgr.SessionStart(w, r)
+	sess := manager.SessionStart(w, r)
 	v := sess.Get("uinfo")
 	if v != nil {
 		uinfo := v.(*userInfo)
@@ -972,9 +948,9 @@ func newClient(uinfo *userInfo) (*clientv3.Client, error) {
 	}
 
 	conf := clientv3.Config{
-		Endpoints:            endpoints,
-		DialTimeout:          time.Second * time.Duration(*connectTimeout),
-		TLS:                  tlsConfig,
+		Endpoints:   endpoints,
+		DialTimeout: time.Second * time.Duration(*connectTimeout),
+		TLS:         tlsConfig,
 		DialOptions: []grpc.DialOption{grpc.WithBlock()},
 	}
 	if *useAuth {
@@ -1046,7 +1022,6 @@ func getInfo(host string) map[string]string {
 	}
 	defer rootClient.Close()
 
-
 	status, err := rootClient.Status(context.Background(), host)
 	if err != nil {
 		log.Fatal(err)
@@ -1056,8 +1031,8 @@ func getInfo(host string) map[string]string {
 		log.Fatal(err)
 	}
 	kb := 1024
-	mb := kb*1024
-	gb := mb*1024
+	mb := kb * 1024
+	gb := mb * 1024
 	var sizeStr string
 	for _, m := range mems.Members {
 		if m.ID == status.Leader {
@@ -1089,5 +1064,5 @@ func getInfo(host string) map[string]string {
 }
 
 func size(num int, unit int) (n, rem int) {
-	return num/unit, num - (num/unit)*unit
+	return num / unit, num - (num/unit)*unit
 }
